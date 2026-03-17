@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data files (large binaries)
+data/*.bin
+data/*.npy
+
+# Checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Logs
+logs/
+*.log
+wandb/
+
+# Local tools
+.claude/
+
+# Env
+.env
+venv/
+.venv/

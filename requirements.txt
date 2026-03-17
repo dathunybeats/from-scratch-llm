@@ -1,0 +1,27 @@
+# ScratchLLM Requirements
+# Install: pip install -r requirements.txt
+
+# Core
+torch>=2.1.0            # PyTorch with scaled_dot_product_attention (Flash Attention 2 backend)
+numpy>=1.24.0
+
+# Tokenizer (optional — for TiktokenWrapper shortcut)
+tiktoken>=0.5.0
+
+# Data
+datasets>=2.14.0         # HuggingFace datasets (for downloading training data)
+tqdm>=4.65.0
+
+# Training utilities
+wandb>=0.15.0            # Experiment tracking (optional, pass --wandb to train.py)
+
+# Optional: True Flash Attention 2 (faster than PyTorch SDPA on older GPUs)
+# Only needed for GPUs without PyTorch 2.x built-in Flash Attention support
+# flash-attn>=2.3.0      # Requires CUDA 11.8+ and compatible GPU
+
+# Optional: Quantization for cheap inference
+# bitsandbytes>=0.41.0   # 4-bit/8-bit quantization
+# auto-gptq>=0.4.0       # GPTQ quantization
+
+# Dev / testing
+pytest>=7.4.0

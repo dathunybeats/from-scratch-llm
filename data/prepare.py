@@ -1,0 +1,169 @@
+"""
+Data preparation script.
+Converts raw text into memory-mapped binary token files for efficient training.
+
+Usage:
+    # From a text file
+    python data/prepare.py --input corpus.txt --output data/train.bin --tokenizer tokenizer/
+
+    # From HuggingFace datasets
+    python data/prepare.py --hf_dataset "openwebtext" --output data/ --tokenizer tokenizer/
+
+    # Train the tokenizer first
+    python data/prepare.py --train_tokenizer --input corpus.txt --vocab_size 32000 --save_tokenizer tokenizer/
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def train_tokenizer(text_file: str, vocab_size: int, save_dir: str):
+    from tokenizer.bpe import BPETokenizer
+    print(f"Training BPE tokenizer on {text_file} (vocab_size={vocab_size})")
+    with open(text_file, encoding="utf-8") as f:
+        text = f.read()
+    tok = BPETokenizer()
+    tok.train(text, vocab_size=vocab_size, verbose=True)
+    tok.save(save_dir)
+    print(f"Tokenizer saved to {save_dir}")
+    return tok
+
+
+def tokenize_file(
+    text_file: str,
+    output_file: str,
+    tokenizer_dir: str,
+    chunk_size: int = 1_000_000,
+):
+    """Tokenize a large text file into a binary token file."""
+    from tokenizer.bpe import BPETokenizer
+    tok = BPETokenizer.load(tokenizer_dir)
+    print(f"Tokenizing {text_file} → {output_file}")
+
+    all_ids = []
+    total_tokens = 0
+
+    with open(text_file, encoding="utf-8") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            ids = tok.encode(chunk)
+            all_ids.extend(ids)
+            total_tokens += len(ids)
+            print(f"  Processed {total_tokens:,} tokens...", end="\r")
+
+    print(f"\nTotal tokens: {total_tokens:,}")
+    arr = np.array(all_ids, dtype=np.uint16)
+    with open(output_file, "wb") as f:
+        f.write(arr.tobytes())
+    print(f"Saved to {output_file} ({arr.nbytes / 1e9:.2f} GB)")
+
+
+def tokenize_hf_dataset(
+    dataset_name: str,
+    output_dir: str,
+    tokenizer_dir: str,
+    split: str = "train",
+    text_column: str = "text",
+    num_proc: int = 8,
+):
+    """Tokenize a HuggingFace dataset."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("Install datasets: pip install datasets")
+        return
+
+    from tokenizer.bpe import BPETokenizer
+    tok = BPETokenizer.load(tokenizer_dir)
+
+    print(f"Loading {dataset_name} ({split})")
+    ds = load_dataset(dataset_name, split=split, num_proc=num_proc)
+
+    def tokenize(batch):
+        return {"ids": [tok.encode(text, add_eos=True) for text in batch[text_column]]}
+
+    ds = ds.map(tokenize, batched=True, num_proc=num_proc, remove_columns=ds.column_names)
+
+    # Flatten and save
+    all_ids = []
+    for sample in ds:
+        all_ids.extend(sample["ids"])
+
+    arr = np.array(all_ids, dtype=np.uint16)
+    output_file = os.path.join(output_dir, f"{split}.bin")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(output_file, "wb") as f:
+        f.write(arr.tobytes())
+    print(f"Saved {len(arr):,} tokens to {output_file}")
+
+
+def create_dummy_data(output_dir: str, tokenizer_dir: str, num_tokens: int = 1_000_000):
+    """Create dummy training data for testing the pipeline."""
+    from tokenizer.bpe import BPETokenizer
+
+    output_dir = os.path.abspath(output_dir)
+    tokenizer_dir = os.path.abspath(tokenizer_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Simple repeating text for smoke testing
+    sample_text = """The quick brown fox jumps over the lazy dog.
+    In the beginning was the Word, and the Word was with God.
+    To be, or not to be, that is the question.
+    It was the best of times, it was the worst of times.
+    All happy families are alike; each unhappy family is unhappy in its own way.
+    Call me Ishmael. Some years ago—never mind how long precisely—having little or no money in my purse.
+    """ * 10000
+
+    # Check if tokenizer exists, if not create a tiny one
+    if not os.path.exists(os.path.join(tokenizer_dir, "tokenizer.json")):
+        print("Training tiny tokenizer on dummy data...")
+        tok = BPETokenizer()
+        tok.train(sample_text, vocab_size=1000, verbose=False)
+        tok.save(tokenizer_dir)
+    else:
+        tok = BPETokenizer.load(tokenizer_dir)
+
+    ids = tok.encode(sample_text * 3)
+    ids = (ids * (num_tokens // len(ids) + 1))[:num_tokens]
+    arr = np.array(ids, dtype=np.uint16)
+
+    # 90/10 train/val split
+    split = int(0.9 * len(arr))
+    os.makedirs(output_dir, exist_ok=True)  # ensure it exists right before writing
+    train_path = os.path.join(output_dir, "train.bin")
+    val_path   = os.path.join(output_dir, "val.bin")
+    arr[:split].tofile(train_path)
+    arr[split:].tofile(val_path)
+    print(f"Dummy data: {split:,} train tokens, {len(arr)-split:,} val tokens")
+    print(f"  train -> {train_path}")
+    print(f"  val   -> {val_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, help="Input text file")
+    parser.add_argument("--output", type=str, default="data/", help="Output directory or file")
+    parser.add_argument("--tokenizer", type=str, default="tokenizer/", help="Tokenizer directory")
+    parser.add_argument("--hf_dataset", type=str, help="HuggingFace dataset name")
+    parser.add_argument("--train_tokenizer", action="store_true")
+    parser.add_argument("--vocab_size", type=int, default=32000)
+    parser.add_argument("--save_tokenizer", type=str, default="tokenizer/")
+    parser.add_argument("--dummy", action="store_true", help="Create dummy data for testing")
+    args = parser.parse_args()
+
+    if args.dummy:
+        create_dummy_data(args.output, args.tokenizer)
+    elif args.train_tokenizer:
+        train_tokenizer(args.input, args.vocab_size, args.save_tokenizer)
+    elif args.hf_dataset:
+        tokenize_hf_dataset(args.hf_dataset, args.output, args.tokenizer)
+    elif args.input:
+        tokenize_file(args.input, args.output, args.tokenizer)
+    else:
+        print("Use --dummy to create test data, or provide --input / --hf_dataset")
