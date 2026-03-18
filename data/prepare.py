@@ -109,6 +109,7 @@ def download_fineweb_edu(
     subset: str = "sample-10BT",
     val_fraction: float = 0.005,
     shard_size: int = 100_000_000,
+    max_tokens: int = 0,
 ):
     """
     Download and tokenize FineWeb-Edu from HuggingFace.
@@ -169,6 +170,11 @@ def download_fineweb_edu(
 
         if total_docs % 5000 == 0:
             print(f"  {total_docs:,} docs | {total_tokens/1e9:.2f}B tokens", end="\r")
+
+        # Stop early if max_tokens reached
+        if max_tokens > 0 and total_tokens >= max_tokens:
+            print(f"\nReached max_tokens limit ({max_tokens/1e9:.2f}B), stopping early.")
+            break
 
         # Flush shards to disk to avoid OOM on huge datasets
         if len(train_ids) >= shard_size:
@@ -254,12 +260,14 @@ if __name__ == "__main__":
                         help="Download & tokenize FineWeb-Edu (best free pre-training dataset)")
     parser.add_argument("--subset", type=str, default="sample-10BT",
                         help="FineWeb-Edu subset: sample-10BT | sample-100BT | default")
+    parser.add_argument("--max_tokens", type=int, default=0,
+                        help="Stop after this many tokens (0=no limit). Use to cap disk usage.")
     args = parser.parse_args()
 
     if args.dummy:
         create_dummy_data(args.output, args.tokenizer)
     elif args.fineweb:
-        download_fineweb_edu(args.output, args.tokenizer, subset=args.subset)
+        download_fineweb_edu(args.output, args.tokenizer, subset=args.subset, max_tokens=args.max_tokens)
     elif args.train_tokenizer:
         train_tokenizer(args.input, args.vocab_size, args.save_tokenizer)
     elif args.hf_dataset:
