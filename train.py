@@ -12,6 +12,7 @@ Quick smoke test:
     python train.py --config nano --dummy --max_steps 100
 """
 import argparse
+import json
 import os
 import sys
 
@@ -41,17 +42,22 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1,
+                        help="min_lr = lr * min_lr_ratio (default: 0.1)")
     parser.add_argument("--warmup_steps", type=int, default=2000)
+    parser.add_argument("--lr_decay_steps", type=int, default=None,
+                        help="Steps over which to decay LR (default: same as max_steps)")
+    parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
 
     # Efficiency / quality upgrades
     parser.add_argument("--compile", action="store_true",
-                        help="torch.compile for 15-50%% training speedup (requires PyTorch 2.0+, best on Linux/CUDA)")
+                        help="torch.compile for 15-50%% speedup (PyTorch 2.0+, best on Linux/CUDA)")
     parser.add_argument("--grad_checkpointing", action="store_true",
                         help="Gradient checkpointing: saves ~60%% activation memory at ~30%% compute cost")
     parser.add_argument("--qk_norm", action="store_true",
-                        help="QK-Norm (Llama 3): prevents attention entropy collapse on long training runs")
-    parser.add_argument("--num_workers", type=int, default=0,
+                        help="QK-Norm (Llama 3): prevents attention entropy collapse (nano enables this by default)")
+    parser.add_argument("--num_workers", type=int, default=2,
                         help="DataLoader worker processes (0=safe on Windows; 2-4 recommended on Linux)")
 
     # Output
@@ -63,9 +69,18 @@ def main():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=500)
+    parser.add_argument("--eval_steps", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=1000)
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # GPU performance settings
+    # TF32 gives full bf16 speedup on Ampere+ GPUs (RTX 3090, A100, etc.)
+    # with minimal precision loss vs fp32. Always enable on CUDA.
+    # ------------------------------------------------------------------
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # ------------------------------------------------------------------
     # Imports (after argparse so --help is fast)
@@ -94,6 +109,33 @@ def main():
         args.warmup_steps = 10
 
     # ------------------------------------------------------------------
+    # CRITICAL: validate that tokenizer vocab_size matches model config
+    # This prevents the #1 silent failure: training on data tokenized with
+    # the wrong tokenizer, producing garbled output regardless of training.
+    # ------------------------------------------------------------------
+    data_dir = os.path.dirname(os.path.abspath(args.data))
+    metadata_path = os.path.join(data_dir, "metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path) as f:
+            meta = json.load(f)
+        data_vocab_size = meta.get("vocab_size", None)
+        model_config_preview = CONFIGS[args.config]()
+        if data_vocab_size is not None and data_vocab_size != model_config_preview.vocab_size:
+            print("\n" + "=" * 60)
+            print("VOCAB SIZE MISMATCH — cannot train!")
+            print(f"  Data tokenized with vocab_size = {data_vocab_size}")
+            print(f"  Model config '{args.config}' expects vocab_size = {model_config_preview.vocab_size}")
+            print()
+            print("Fix: re-run setup with the correct vocab size:")
+            print(f"  python data/prepare.py --setup --vocab_size {model_config_preview.vocab_size} --overwrite")
+            print("=" * 60 + "\n")
+            sys.exit(1)
+        print(f"Vocab check passed: data and model both use vocab_size={data_vocab_size}")
+    else:
+        print("Note: no metadata.json found — skipping vocab size check.")
+        print("  Run 'python data/prepare.py --setup' to generate metadata automatically.")
+
+    # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
     model_config = CONFIGS[args.config]()
@@ -112,7 +154,11 @@ def main():
     total_params = model.num_parameters()
     print(f"\nModel: ScratchLLM-{args.config}")
     print(f"Parameters: {total_params/1e6:.1f}M")
-    print(f"Non-embedding params: {model.num_parameters(exclude_embeddings=True)/1e6:.1f}M\n")
+    print(f"Non-embedding params: {model.num_parameters(exclude_embeddings=True)/1e6:.1f}M")
+    print(f"Tied embeddings: {model_config.tie_word_embeddings}")
+    print(f"QK-Norm: {model_config.qk_norm}")
+    print(f"Label smoothing: {model_config.label_smoothing}")
+    print(f"Z-loss weight: {model_config.z_loss_weight}\n")
 
     # ------------------------------------------------------------------
     # Data
@@ -136,6 +182,9 @@ def main():
         train_loader = make_dataloader(train_dataset, args.batch_size, num_workers=nw, pin_memory=pin)
         val_loader = make_dataloader(val_dataset, args.batch_size, num_workers=nw, pin_memory=pin) if val_dataset else None
 
+    if val_loader is None:
+        print("Warning: no --val_data provided. best.pt will not be saved (no validation loss to track).")
+
     # ------------------------------------------------------------------
     # Training config
     # ------------------------------------------------------------------
@@ -148,7 +197,10 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         seq_len=seq_len,
         learning_rate=args.lr,
+        min_lr_ratio=args.min_lr_ratio,
         warmup_steps=args.warmup_steps,
+        lr_decay_steps=args.lr_decay_steps,
+        weight_decay=args.weight_decay,
         dtype=args.dtype,
         resume_from=args.resume,
         compile_model=args.compile,
@@ -157,6 +209,7 @@ def main():
         wandb_project="scratchllm",
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
+        eval_steps=args.eval_steps,
         save_interval=args.save_interval,
     )
 

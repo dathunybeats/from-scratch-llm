@@ -58,6 +58,9 @@ class ShuffledTokenDataset(IterableDataset):
     """
     Streaming dataset that randomly samples chunks from a large token file.
     Better for training than sequential access (avoids distribution shifts mid-epoch).
+
+    Each DataLoader worker gets a different seed (worker_id offset) so parallel
+    workers don't yield the same sequences.
     """
 
     def __init__(self, bin_file: str, seq_len: int, seed: int = 42):
@@ -67,7 +70,10 @@ class ShuffledTokenDataset(IterableDataset):
         self.num_tokens = len(self.data)
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        rng = np.random.default_rng(self.seed)
+        # Offset seed by worker ID so parallel workers yield different samples
+        worker_info = torch.utils.data.get_worker_info()
+        seed = self.seed + (worker_info.id if worker_info is not None else 0)
+        rng = np.random.default_rng(seed)
         while True:
             start = rng.integers(0, self.num_tokens - self.seq_len - 1)
             chunk = torch.from_numpy(self.data[start:start + self.seq_len + 1].astype(np.int64))
@@ -200,6 +206,9 @@ def make_dataloader(
 ) -> DataLoader:
     import torch
     pin = pin_memory and torch.cuda.is_available()
+    # persistent_workers=True avoids worker restart overhead between iterations
+    # (only when num_workers > 0, otherwise it's a no-op that causes a warning)
+    persist = num_workers > 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -207,5 +216,5 @@ def make_dataloader(
         num_workers=num_workers,
         pin_memory=pin,
         drop_last=True,
-        persistent_workers=False,
+        persistent_workers=persist,
     )

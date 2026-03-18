@@ -253,11 +253,24 @@ class ScratchLLM(nn.Module):
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
 
+            # Label smoothing: only during training (eval should report true NLL for fair comparison)
+            ls = getattr(self.config, 'label_smoothing', 0.0) if self.training else 0.0
+
             loss = F.cross_entropy(
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
+                label_smoothing=ls,
             )
+
+            # Z-loss: penalizes large softmax normalizers (from Gemini/PaLM).
+            # Prevents logit scale explosion that causes training instability over long runs.
+            # Formula: z_loss = weight * E[log(sum(exp(logits)))^2]
+            z_loss_weight = getattr(self.config, 'z_loss_weight', 0.0)
+            if self.training and z_loss_weight > 0:
+                log_z = torch.logsumexp(shift_logits.view(-1, self.config.vocab_size).float(), dim=-1)
+                z_loss = z_loss_weight * log_z.pow(2).mean()
+                loss = loss + z_loss
 
             # Add MTP auxiliary loss
             if mtp_logits is not None:

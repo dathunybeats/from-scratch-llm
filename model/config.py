@@ -61,6 +61,13 @@ class ModelConfig:
     use_gradient_checkpointing: bool = False  # Recompute activations on backward (saves ~60% memory, ~30% slower)
     qk_norm: bool = False                     # QK-Norm before RoPE (Llama 3) — prevents attention entropy collapse
 
+    # -------------------------------------------------------------------
+    # Loss / regularization
+    # -------------------------------------------------------------------
+    label_smoothing: float = 0.0   # Label smoothing for cross-entropy (0.1 reduces overconfidence)
+    z_loss_weight: float = 0.0     # Z-loss: penalizes large logit scales (Gemini/PaLM, 1e-4 recommended)
+                                   # Prevents softmax from becoming saturated during long training runs
+
     def __post_init__(self):
         assert self.hidden_size % self.num_heads == 0, \
             f"hidden_size {self.hidden_size} must be divisible by num_heads {self.num_heads}"
@@ -78,7 +85,7 @@ class ModelConfig:
 # -----------------------------------------------------------------------
 
 def get_nano_config() -> ModelConfig:
-    """~125M parameters. Trainable on any GPU with 8GB VRAM."""
+    """~50M parameters (tied embeddings). Trainable on any GPU with 8GB VRAM."""
     return ModelConfig(
         vocab_size=32000,
         hidden_size=512,
@@ -88,6 +95,10 @@ def get_nano_config() -> ModelConfig:
         num_kv_heads=2,
         max_seq_len=2048,
         rope_theta=10000.0,
+        tie_word_embeddings=True, # Saves 16M params, often improves small model quality
+        qk_norm=True,             # Llama 3: prevents attention entropy collapse, ~0 compute cost
+        label_smoothing=0.1,      # Reduces overconfidence, standard for language models
+        z_loss_weight=1e-4,       # Gemini-style logit scale regularization
     )
 
 

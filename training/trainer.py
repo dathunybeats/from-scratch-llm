@@ -65,7 +65,7 @@ class TrainingConfig:
 
     # Evaluation & logging
     eval_interval: int = 500
-    eval_steps: int = 50                       # Steps of evaluation data to average over
+    eval_steps: int = 50                       # Number of val batches to average over
     log_interval: int = 10
     save_interval: int = 1000
 
@@ -394,14 +394,26 @@ class Trainer:
                 if old != path:
                     os.remove(old)
 
+        # Unwrap torch.compile to access the real model config
+        raw_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+
         torch.save({
             "step": self.step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scaler_state_dict": self.scaler.state_dict(),
             "best_val_loss": self.best_val_loss,
-            "config": self.model.config,
+            "config": raw_model.config,
         }, path)
+
+        # Also save config as plain JSON — survives checkpoint corruption and is
+        # human-readable. Useful for reconstructing models without the full .pt file.
+        import json, dataclasses
+        config_path = os.path.join(self.config.out_dir, "model_config.json")
+        if not os.path.exists(config_path):
+            with open(config_path, "w") as f:
+                json.dump(dataclasses.asdict(raw_model.config), f, indent=2)
+
         print(f"  Checkpoint saved: {path}")
 
     def _load_checkpoint(self, path: str):
