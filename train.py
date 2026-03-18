@@ -44,6 +44,16 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
 
+    # Efficiency / quality upgrades
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile for 15-50%% training speedup (requires PyTorch 2.0+, best on Linux/CUDA)")
+    parser.add_argument("--grad_checkpointing", action="store_true",
+                        help="Gradient checkpointing: saves ~60%% activation memory at ~30%% compute cost")
+    parser.add_argument("--qk_norm", action="store_true",
+                        help="QK-Norm (Llama 3): prevents attention entropy collapse on long training runs")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="DataLoader worker processes (0=safe on Windows; 2-4 recommended on Linux)")
+
     # Output
     parser.add_argument("--out_dir", default="checkpoints")
     parser.add_argument("--run_name", default=None)
@@ -90,7 +100,13 @@ def main():
     if args.use_mtp:
         model_config.use_mtp = True
     if args.seq_len:
-        model_config.seq_len = args.seq_len
+        model_config.max_seq_len = args.seq_len
+    if args.grad_checkpointing:
+        model_config.use_gradient_checkpointing = True
+        print("Gradient checkpointing enabled (saves ~60% activation memory)")
+    if args.qk_norm:
+        model_config.qk_norm = True
+        print("QK-Norm enabled (Llama 3 attention stability)")
 
     model = ScratchLLM(model_config)
     total_params = model.num_parameters()
@@ -103,19 +119,22 @@ def main():
     # ------------------------------------------------------------------
     seq_len = args.seq_len or model_config.max_seq_len
 
+    pin = torch.cuda.is_available()
+    nw  = args.num_workers
+
     if args.mode == "pretrain":
         train_dataset = ShuffledTokenDataset(args.data, seq_len)
         val_dataset = TokenizedDataset(args.val_data, seq_len) if args.val_data else None
-        train_loader = make_dataloader(train_dataset, args.batch_size, shuffle=False)
-        val_loader = make_dataloader(val_dataset, args.batch_size, shuffle=False) if val_dataset else None
+        train_loader = make_dataloader(train_dataset, args.batch_size, num_workers=nw, shuffle=False, pin_memory=pin)
+        val_loader = make_dataloader(val_dataset, args.batch_size, num_workers=nw, shuffle=False, pin_memory=pin) if val_dataset else None
     else:
         # SFT
         from tokenizer.bpe import BPETokenizer
         tok = BPETokenizer.load(args.tokenizer)
         train_dataset = InstructionDataset(args.data, tok, seq_len)
         val_dataset = InstructionDataset(args.val_data, tok, seq_len) if args.val_data else None
-        train_loader = make_dataloader(train_dataset, args.batch_size)
-        val_loader = make_dataloader(val_dataset, args.batch_size) if val_dataset else None
+        train_loader = make_dataloader(train_dataset, args.batch_size, num_workers=nw, pin_memory=pin)
+        val_loader = make_dataloader(val_dataset, args.batch_size, num_workers=nw, pin_memory=pin) if val_dataset else None
 
     # ------------------------------------------------------------------
     # Training config
@@ -132,6 +151,8 @@ def main():
         warmup_steps=args.warmup_steps,
         dtype=args.dtype,
         resume_from=args.resume,
+        compile_model=args.compile,
+        num_workers=args.num_workers,
         use_wandb=args.wandb,
         wandb_project="scratchllm",
         log_interval=args.log_interval,

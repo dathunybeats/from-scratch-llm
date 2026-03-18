@@ -21,6 +21,25 @@ from .config import ModelConfig
 from .rope import RoPE
 
 
+class QKNorm(nn.Module):
+    """
+    Per-head RMS normalization applied to Q and K before RoPE.
+    From Llama 3 — prevents attention logit explosion during long training runs,
+    which causes entropy collapse (all attention mass on one token → useless heads).
+    Costs ~0 extra compute, stabilizes training significantly.
+    """
+
+    def __init__(self, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(head_dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, heads, T, head_dim] — normalize over last dim
+        norm = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (norm * self.weight).to(x.dtype)
+
+
 class KVCache:
     """
     Pre-allocated KV cache for fast autoregressive inference.
@@ -86,6 +105,14 @@ class GroupedQueryAttention(nn.Module):
         self.rope = RoPE(self.head_dim, config.max_seq_len, config.rope_theta)
         self.attn_dropout = config.attention_dropout
 
+        # QK-Norm (Llama 3) — one norm per head dimension, separate for Q and K
+        if config.qk_norm:
+            self.q_norm = QKNorm(self.head_dim)
+            self.k_norm = QKNorm(self.head_dim)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
         # Check Flash Attention availability once
         self._flash_available = self._check_flash()
 
@@ -116,6 +143,11 @@ class GroupedQueryAttention(nn.Module):
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        # QK-Norm before RoPE (Llama 3) — prevents logit explosion on long runs
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
         # Apply RoPE
         q, k = self.rope(q, k, position_ids)
 
@@ -128,8 +160,8 @@ class GroupedQueryAttention(nn.Module):
             k = k.repeat_interleave(self.num_query_groups, dim=1)  # [B, num_heads, S, head_dim]
             v = v.repeat_interleave(self.num_query_groups, dim=1)
 
-        # Attention
-        if self.config.use_flash_attention and self._flash_available and not self.training:
+        # Attention — flash_attn is valuable during training (memory + speed), not just inference
+        if self.config.use_flash_attention and self._flash_available:
             attn_out = self._flash_attention(q, k, v)
         else:
             attn_out = self._standard_attention(q, k, v, attention_mask, T)

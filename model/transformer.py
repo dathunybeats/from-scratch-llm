@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .config import ModelConfig
 from .attention import GroupedQueryAttention, KVCache
@@ -219,7 +220,17 @@ class ScratchLLM(nn.Module):
 
         for idx, layer in enumerate(self.layers):
             cache = kv_caches[idx] if kv_caches else None
-            x, new_cache, aux_loss = layer(x, attention_mask, position_ids, cache, use_cache)
+
+            # Gradient checkpointing: recompute activations on backward instead of storing them.
+            # Saves ~60% of activation memory at the cost of ~30% extra compute.
+            # Only applies during training (use_cache=False); inference always takes the normal path.
+            if self.config.use_gradient_checkpointing and self.training and not use_cache:
+                x, new_cache, aux_loss = grad_checkpoint(
+                    layer, x, attention_mask, position_ids, None, False,
+                    use_reentrant=False,
+                )
+            else:
+                x, new_cache, aux_loss = layer(x, attention_mask, position_ids, cache, use_cache)
 
             if use_cache:
                 new_caches.append(new_cache)

@@ -103,6 +103,101 @@ def tokenize_hf_dataset(
     print(f"Saved {len(arr):,} tokens to {output_file}")
 
 
+def download_fineweb_edu(
+    output_dir: str,
+    tokenizer_dir: str,
+    subset: str = "sample-10BT",
+    val_fraction: float = 0.005,
+    shard_size: int = 100_000_000,
+):
+    """
+    Download and tokenize FineWeb-Edu from HuggingFace.
+
+    FineWeb-Edu is the best freely available pre-training dataset:
+    - Filtered Common Crawl with educational quality scoring
+    - 1.3T tokens total; "sample-10BT" = 10B tokens (good starting point)
+    - Outperforms The Pile, C4, and OpenWebText on downstream benchmarks
+
+    Subsets:
+        "sample-10BT"   — 10B tokens,  ~21 GB download  (RTX 3090 / 4090 scale)
+        "sample-100BT"  — 100B tokens, ~210 GB download  (A100 scale)
+        "default"       — 1.3T tokens, full dataset      (datacenter scale)
+
+    Usage:
+        python data/prepare.py --fineweb --output data/ --tokenizer tokenizer/
+        python data/prepare.py --fineweb --subset sample-100BT --output data/ --tokenizer tokenizer/
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("Install datasets: pip install datasets")
+        return
+
+    from tokenizer.bpe import BPETokenizer
+    import tqdm as _tqdm
+
+    tok = BPETokenizer.load(tokenizer_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Streaming FineWeb-Edu ({subset}) from HuggingFace...")
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-edu",
+        name=subset,
+        split="train",
+        streaming=True,
+    )
+
+    train_path = os.path.join(output_dir, "train.bin")
+    val_path   = os.path.join(output_dir, "val.bin")
+
+    train_ids = []
+    val_ids   = []
+    total_docs = 0
+    total_tokens = 0
+
+    print("Tokenizing (streaming — no full dataset download required)...")
+    for doc in ds:
+        text = doc["text"]
+        ids = tok.encode(text, add_eos=True)
+        total_tokens += len(ids)
+        total_docs   += 1
+
+        if total_docs % round(1 / val_fraction) == 0:
+            val_ids.extend(ids)
+        else:
+            train_ids.extend(ids)
+
+        if total_docs % 5000 == 0:
+            print(f"  {total_docs:,} docs | {total_tokens/1e9:.2f}B tokens", end="\r")
+
+        # Flush shards to disk to avoid OOM on huge datasets
+        if len(train_ids) >= shard_size:
+            _flush(train_ids, train_path)
+            train_ids = []
+        if len(val_ids) >= shard_size // 10:
+            _flush(val_ids, val_path)
+            val_ids = []
+
+    # Final flush
+    if train_ids:
+        _flush(train_ids, train_path)
+    if val_ids:
+        _flush(val_ids, val_path)
+
+    print(f"\nDone! {total_docs:,} documents | {total_tokens/1e9:.2f}B tokens")
+    print(f"  train -> {train_path}")
+    print(f"  val   -> {val_path}")
+    print(f"\nTip: Train with:")
+    print(f"  python train.py --config small --data {train_path} --val_data {val_path} --compile --grad_checkpointing")
+
+
+def _flush(ids: list, path: str):
+    """Append a list of token IDs to a binary file."""
+    arr = np.array(ids, dtype=np.uint16)
+    with open(path, "ab") as f:
+        f.write(arr.tobytes())
+
+
 def create_dummy_data(output_dir: str, tokenizer_dir: str, num_tokens: int = 1_000_000):
     """Create dummy training data for testing the pipeline."""
     from tokenizer.bpe import BPETokenizer
@@ -155,10 +250,16 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_size", type=int, default=32000)
     parser.add_argument("--save_tokenizer", type=str, default="tokenizer/")
     parser.add_argument("--dummy", action="store_true", help="Create dummy data for testing")
+    parser.add_argument("--fineweb", action="store_true",
+                        help="Download & tokenize FineWeb-Edu (best free pre-training dataset)")
+    parser.add_argument("--subset", type=str, default="sample-10BT",
+                        help="FineWeb-Edu subset: sample-10BT | sample-100BT | default")
     args = parser.parse_args()
 
     if args.dummy:
         create_dummy_data(args.output, args.tokenizer)
+    elif args.fineweb:
+        download_fineweb_edu(args.output, args.tokenizer, subset=args.subset)
     elif args.train_tokenizer:
         train_tokenizer(args.input, args.vocab_size, args.save_tokenizer)
     elif args.hf_dataset:
@@ -166,4 +267,4 @@ if __name__ == "__main__":
     elif args.input:
         tokenize_file(args.input, args.output, args.tokenizer)
     else:
-        print("Use --dummy to create test data, or provide --input / --hf_dataset")
+        print("Use --dummy to create test data, --fineweb for real data, or provide --input / --hf_dataset")

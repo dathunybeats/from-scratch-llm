@@ -55,6 +55,12 @@ class ModelConfig:
     # -------------------------------------------------------------------
     dropout: float = 0.0             # 0 for large models (regularized by data scale)
 
+    # -------------------------------------------------------------------
+    # Training efficiency
+    # -------------------------------------------------------------------
+    use_gradient_checkpointing: bool = False  # Recompute activations on backward (saves ~60% memory, ~30% slower)
+    qk_norm: bool = False                     # QK-Norm before RoPE (Llama 3) — prevents attention entropy collapse
+
     def __post_init__(self):
         assert self.hidden_size % self.num_heads == 0, \
             f"hidden_size {self.hidden_size} must be divisible by num_heads {self.num_heads}"

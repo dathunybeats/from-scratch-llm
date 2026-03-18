@@ -72,6 +72,10 @@ class TrainingConfig:
     # Resuming
     resume_from: Optional[str] = None
 
+    # Speed / memory optimizations
+    compile_model: bool = False      # torch.compile for 15-50% training speedup (Linux/CUDA recommended)
+    num_workers: int = 0             # DataLoader workers (0=safe on Windows; 2-4 on Linux)
+
     # Logging
     use_wandb: bool = False
     wandb_project: str = "scratchllm"
@@ -127,6 +131,16 @@ class Trainer:
         # Device setup
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = self.model.to(self.device)
+
+        # torch.compile — fuses ops and generates optimized CUDA kernels (15-50% speedup).
+        # Requires PyTorch 2.0+. Falls back gracefully on Windows/CPU.
+        if config.compile_model:
+            try:
+                print("Compiling model with torch.compile...")
+                self.model = torch.compile(self.model)
+                print("  Model compiled successfully.")
+            except Exception as e:
+                print(f"  torch.compile not available ({e}), running without compilation.")
 
         # Precision
         self.dtype = {
@@ -204,6 +218,47 @@ class Trainer:
             group["lr"] = lr
         return lr
 
+    def _estimate_mfu(self, tokens_per_sec: float) -> float:
+        """
+        Estimate Model FLOP Utilization (MFU).
+        MFU = achieved FLOP/s / peak GPU FLOP/s.
+        A100 80GB bf16 peak ≈ 312 TFLOP/s; RTX 4090 bf16 ≈ 165 TFLOP/s.
+
+        Approximate FLOPs per token (forward pass only):
+          6 * N_params  (rule of thumb: 2 per matmul weight, 3 matmuls fwd+bwd ≈ 6N)
+        For forward+backward: multiply by 3.
+        """
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            # Try to get GPU peak TFLOP/s from device name
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            if "a100" in gpu_name:
+                peak_flops = 312e12
+            elif "h100" in gpu_name:
+                peak_flops = 989e12
+            elif "4090" in gpu_name:
+                peak_flops = 165e12
+            elif "3090" in gpu_name:
+                peak_flops = 71e12
+            elif "3080" in gpu_name:
+                peak_flops = 45e12
+            else:
+                return 0.0  # Unknown GPU, skip
+
+            # Params in the (potentially compiled) underlying model
+            model = self.model
+            if hasattr(model, "_orig_mod"):  # unwrap torch.compile
+                model = model._orig_mod
+            n_params = model.num_parameters(exclude_embeddings=True)
+
+            # FLOPs for forward+backward ≈ 6 * N_params per token
+            flops_per_token = 6 * n_params
+            achieved_flops = flops_per_token * tokens_per_sec
+            return achieved_flops / peak_flops
+        except Exception:
+            return 0.0
+
     def train(self):
         """Main training loop."""
         self.model.train()
@@ -260,18 +315,24 @@ class Trainer:
                     self.config.effective_batch_size * self.config.seq_len / dt
                 )
                 avg_loss = sum(losses[-self.config.log_interval:]) / self.config.log_interval
+                ppl = math.exp(min(avg_loss, 20))  # cap to avoid overflow on early steps
+                mfu = self._estimate_mfu(tokens_per_sec)
+                mfu_str = f" | MFU {mfu:.1%}" if mfu > 0 else ""
                 print(
-                    f"step {self.step:6d} | loss {avg_loss:.4f} | lr {lr:.2e} | "
-                    f"grad_norm {grad_norm:.2f} | {tokens_per_sec/1000:.1f}K tok/s"
+                    f"step {self.step:6d} | loss {avg_loss:.4f} | ppl {ppl:.1f} | "
+                    f"lr {lr:.2e} | grad_norm {grad_norm:.2f} | "
+                    f"{tokens_per_sec/1000:.1f}K tok/s{mfu_str}"
                 )
                 t0 = t1
 
                 if self.wandb:
                     self.wandb.log({
                         "train/loss": avg_loss,
+                        "train/ppl": ppl,
                         "train/lr": lr,
                         "train/grad_norm": grad_norm,
                         "train/tokens_per_sec": tokens_per_sec,
+                        "train/mfu": mfu,
                     }, step=self.step)
 
             # Evaluation
