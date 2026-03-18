@@ -110,6 +110,7 @@ def download_fineweb_edu(
     val_fraction: float = 0.005,
     shard_size: int = 100_000_000,
     max_tokens: int = 0,
+    overwrite: bool = False,
 ):
     """
     Download and tokenize FineWeb-Edu from HuggingFace.
@@ -128,6 +129,8 @@ def download_fineweb_edu(
         python data/prepare.py --fineweb --output data/ --tokenizer tokenizer/
         python data/prepare.py --fineweb --subset sample-100BT --output data/ --tokenizer tokenizer/
     """
+    import time
+
     try:
         from datasets import load_dataset
     except ImportError:
@@ -135,54 +138,90 @@ def download_fineweb_edu(
         return
 
     from tokenizer.bpe import BPETokenizer
-    import tqdm as _tqdm
 
     tok = BPETokenizer.load(tokenizer_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"Streaming FineWeb-Edu ({subset}) from HuggingFace...")
-    ds = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        name=subset,
-        split="train",
-        streaming=True,
-    )
-
     train_path = os.path.join(output_dir, "train.bin")
     val_path   = os.path.join(output_dir, "val.bin")
+
+    # Wipe existing files if overwrite requested
+    if overwrite:
+        for p in (train_path, val_path):
+            if os.path.exists(p):
+                os.remove(p)
+                print(f"Removed existing {p}")
+
+    def _load_ds(skip: int = 0):
+        ds = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            name=subset,
+            split="train",
+            streaming=True,
+        )
+        if skip > 0:
+            ds = ds.skip(skip)
+        return ds
 
     train_ids = []
     val_ids   = []
     total_docs = 0
     total_tokens = 0
+    max_retries = 20
 
+    print(f"Streaming FineWeb-Edu ({subset}) from HuggingFace...")
     print("Tokenizing (streaming — no full dataset download required)...")
-    for doc in ds:
-        text = doc["text"]
-        ids = tok.encode(text, add_eos=True)
-        total_tokens += len(ids)
-        total_docs   += 1
 
-        if total_docs % round(1 / val_fraction) == 0:
-            val_ids.extend(ids)
-        else:
-            train_ids.extend(ids)
+    ds = _load_ds()
+    retries = 0
 
-        if total_docs % 5000 == 0:
-            print(f"  {total_docs:,} docs | {total_tokens/1e9:.2f}B tokens", end="\r")
+    while True:
+        try:
+            for doc in ds:
+                text = doc["text"]
+                ids = tok.encode(text, add_eos=True)
+                total_tokens += len(ids)
+                total_docs   += 1
+                retries = 0  # reset on success
 
-        # Stop early if max_tokens reached
-        if max_tokens > 0 and total_tokens >= max_tokens:
-            print(f"\nReached max_tokens limit ({max_tokens/1e9:.2f}B), stopping early.")
-            break
+                if total_docs % round(1 / val_fraction) == 0:
+                    val_ids.extend(ids)
+                else:
+                    train_ids.extend(ids)
 
-        # Flush shards to disk to avoid OOM on huge datasets
-        if len(train_ids) >= shard_size:
-            _flush(train_ids, train_path)
-            train_ids = []
-        if len(val_ids) >= shard_size // 10:
-            _flush(val_ids, val_path)
-            val_ids = []
+                if total_docs % 5000 == 0:
+                    print(f"  {total_docs:,} docs | {total_tokens/1e9:.2f}B tokens", end="\r")
+
+                if max_tokens > 0 and total_tokens >= max_tokens:
+                    print(f"\nReached {max_tokens/1e9:.2f}B token limit, stopping.")
+                    break
+
+                if len(train_ids) >= shard_size:
+                    _flush(train_ids, train_path)
+                    train_ids = []
+                if len(val_ids) >= shard_size // 10:
+                    _flush(val_ids, val_path)
+                    val_ids = []
+
+            break  # completed without error
+
+        except Exception as e:
+            retries += 1
+            if retries > max_retries:
+                print(f"\nFailed after {max_retries} retries. Saving progress and exiting.")
+                break
+            wait = min(2 ** retries, 60)
+            print(f"\nNetwork error (retry {retries}/{max_retries}, waiting {wait}s): {e}")
+            # Flush what we have before reconnecting
+            if train_ids:
+                _flush(train_ids, train_path)
+                train_ids = []
+            if val_ids:
+                _flush(val_ids, val_path)
+                val_ids = []
+            time.sleep(wait)
+            print(f"  Reconnecting from doc {total_docs:,}...")
+            ds = _load_ds(skip=total_docs)
 
     # Final flush
     if train_ids:
@@ -194,7 +233,7 @@ def download_fineweb_edu(
     print(f"  train -> {train_path}")
     print(f"  val   -> {val_path}")
     print(f"\nTip: Train with:")
-    print(f"  python train.py --config small --data {train_path} --val_data {val_path} --compile --grad_checkpointing")
+    print(f"  python train.py --config nano --data {train_path} --val_data {val_path} --dtype bf16 --grad_checkpointing --compile")
 
 
 def _flush(ids: list, path: str):
@@ -262,12 +301,14 @@ if __name__ == "__main__":
                         help="FineWeb-Edu subset: sample-10BT | sample-100BT | default")
     parser.add_argument("--max_tokens", type=int, default=0,
                         help="Stop after this many tokens (0=no limit). Use to cap disk usage.")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Delete existing data files before downloading (fresh start)")
     args = parser.parse_args()
 
     if args.dummy:
         create_dummy_data(args.output, args.tokenizer)
     elif args.fineweb:
-        download_fineweb_edu(args.output, args.tokenizer, subset=args.subset, max_tokens=args.max_tokens)
+        download_fineweb_edu(args.output, args.tokenizer, subset=args.subset, max_tokens=args.max_tokens, overwrite=args.overwrite)
     elif args.train_tokenizer:
         train_tokenizer(args.input, args.vocab_size, args.save_tokenizer)
     elif args.hf_dataset:
