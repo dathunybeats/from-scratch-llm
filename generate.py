@@ -28,7 +28,10 @@ def main():
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model = ScratchLLM(ckpt["config"])
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Strip _orig_mod. prefix added by torch.compile
+    state_dict = ckpt["model_state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model = model.to(device).to(torch.bfloat16 if device == "cuda" else torch.float32)
     model.eval()
     print(f"Model: {model.num_parameters()/1e6:.1f}M params | step {ckpt.get('step', '?')} | val_loss {ckpt.get('best_val_loss', float('nan')):.4f}\n")
