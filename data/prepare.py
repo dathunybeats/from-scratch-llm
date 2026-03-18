@@ -229,6 +229,11 @@ def download_fineweb_edu(
     if val_ids:
         _flush(val_ids, val_path)
 
+    # Write sentinel file so other processes know download is fully complete
+    done_path = os.path.join(output_dir, ".download_done")
+    with open(done_path, "w") as f:
+        f.write(f"{total_tokens}\n")
+
     print(f"\nDone! {total_docs:,} documents | {total_tokens/1e9:.2f}B tokens")
     print(f"  train -> {train_path}")
     print(f"  val   -> {val_path}")
