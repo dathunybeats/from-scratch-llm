@@ -386,6 +386,14 @@ class Trainer:
     def save_checkpoint(self, filename: str):
         """Save model, optimizer, and training state."""
         path = os.path.join(self.config.out_dir, filename)
+
+        # Delete previous step checkpoint to save disk space (keep only latest)
+        if filename.startswith("step_"):
+            import glob
+            for old in glob.glob(os.path.join(self.config.out_dir, "step_*.pt")):
+                if old != path:
+                    os.remove(old)
+
         torch.save({
             "step": self.step,
             "model_state_dict": self.model.state_dict(),
