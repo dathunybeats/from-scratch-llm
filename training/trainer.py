@@ -407,7 +407,7 @@ class Trainer:
     def _load_checkpoint(self, path: str):
         """Resume from a checkpoint."""
         print(f"Resuming from {path}...")
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         self.scaler.load_state_dict(ckpt["scaler_state_dict"])
